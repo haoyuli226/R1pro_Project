@@ -1,0 +1,15 @@
+bc_model:
+v2: 基础SE+SpatialSoftmax
+v3: SpatialSoftmax+高低层语义融合
+v5: dinov2+Transformer，但是预测单个动作
+
+pkl_2_dataset:
+v2: 已添加深度图
+v3: 未添加，添加chunk_size
+
+train:
+v2: 适配于v5，尚未添加多个动作
+
+bc_controller:
+v1: 读取单帧图像
+v2: 读取多帧图像    均未添加深度图逻辑

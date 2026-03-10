@@ -1,0 +1,7 @@
+ros2 topic pub -1 /motion_target/target_joint_state_arm_right sensor_msgs/msg/JointState "{
+  header: {
+    frame_id: ''
+  },
+  name: ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6', 'joint7'],
+  position: [0.0002127659574468085, 0.0, 0.0, -1.6180851063829786, 0.0, 0.0, 0.0]
+}"

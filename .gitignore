@@ -3,11 +3,16 @@
 *.mcap
 *.pth
 *.onnx
+*.pkl
 *.weights
 data/
 dataset/
 logs/
 runs/
+**/output/
+**/build/
+**/install/
+**/log/
 
 # 过滤 Python 缓存
 __pycache__/
@@ -22,7 +27,6 @@ __pycache__/
 # 过滤掉整个文件夹
 bags/
 processed_data/
-imitate_ws/
 ros2_ws/
 venv/
 act-plus-plus/
