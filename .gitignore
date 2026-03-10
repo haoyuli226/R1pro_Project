@@ -1,0 +1,28 @@
+# 过滤掉庞大的 ROS 数据和模型
+*.bag
+*.mcap
+*.pth
+*.onnx
+*.weights
+data/
+dataset/
+logs/
+runs/
+
+# 过滤 Python 缓存
+__pycache__/
+*.pyc
+
+# 过滤 IDE 配置文件
+.vscode/
+.idea/
+# 补充过滤 .pt 结尾的权重
+*.pt
+
+# 过滤掉整个文件夹
+bags/
+processed_data/
+imitate_ws/
+ros2_ws/
+venv/
+act-plus-plus/
