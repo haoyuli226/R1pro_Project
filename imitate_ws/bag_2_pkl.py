@@ -114,7 +114,7 @@ def parse_bag_for_bc(bag_path, delta_clip=0.1):
                 img = img[:, :, :3] 
                 latest_image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-            if all(v is not None for v in [latest_image, curr_obs_joint_state, curr_arm_target, curr_arm_r_feedback, curr_gripper_target, curr_gripper_feedback, latest_depth]):
+            if all(v is not None for v in [latest_image, curr_obs_joint_state, curr_arm_target, curr_gripper_target, curr_gripper_feedback, latest_depth]):
                 arm_action_delta = np.clip(curr_arm_target - curr_arm_r_feedback, -delta_clip, delta_clip)
                 
                 # Action: 7关节增量 + 1夹爪绝对值

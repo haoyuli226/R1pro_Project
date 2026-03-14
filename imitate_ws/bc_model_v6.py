@@ -25,9 +25,11 @@ class SEBlock(nn.Module):
     
 class SpatialSoftmax(nn.Module):
     # SpatialSoftmax：将卷积特征转换为空间坐标，关注瓶子位置
-    def __init__(self, height, width, channel):
+    def __init__(self, height, width, channel, temperature=0.5):
         super(SpatialSoftmax, self).__init__()
         self.height, self.width, self.channel = height, width, channel
+        self.temperature = temperature
+
         pos_y, pos_x = torch.meshgrid(
             torch.linspace(-1, 1, self.height),
             torch.linspace(-1, 1, self.width),
@@ -38,16 +40,19 @@ class SpatialSoftmax(nn.Module):
 
     def forward(self, x):
         b, c, h, w = x.size()
-        probs = F.softmax(x.view(b, c, -1), dim=-1)
+        logits = x.view(b, c, -1) / self.temperature
+        probs = F.softmax(logits, dim=-1)
         expected_x = torch.sum(probs * self.pos_x, dim=-1)  # [B, 512, 49] -> [B, 512]
         expected_y = torch.sum(probs * self.pos_y, dim=-1)
         return torch.cat([expected_x, expected_y], dim=-1)
     
 
 class BCNet_Transformer(nn.Module):
-    def __init__(self, mode="resnet", joint_dim=25, action_dim=8, nhead=8, num_layers=2, window_size=4):
+    def __init__(self, mode="resnet", joint_dim=25, action_dim=8, nhead=8, 
+        num_layers=2, window_size=4, chunk_size=8):
         super(BCNet_Transformer, self).__init__()
         self.mode = mode
+        self.chunk_size = chunk_size
         # 由于 DINOv2 预训练模型只接受 3 通道，我们添加一个初始卷积层将 4 通道转为 3 通道
         # 或者对于 ResNet 模式，直接修改第一层卷积
         self.input_adapter = nn.Conv2d(4, 3, kernel_size=1)
@@ -55,19 +60,17 @@ class BCNet_Transformer(nn.Module):
         # 使用预训练的dinov2代替resnet18，提取更丰富的视觉特征
         if mode == "vits14":
             self.backbone = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
-            self.backbone.eval()  # 冻结权重
-            # Dino-v2 ViT-S 的输出维度是 384
-            curr_channels = 384 
-            # 输入 224x224，经过 vits14 后特征图大小是 224/14 = 16
-            feat_size = 16 
+            for param in self.backbone.parameters(): param.requires_grad = False
+            for param in self.backbone.blocks[-2:].parameters(): param.requires_grad = True
+            curr_channels, feat_size = 384, 16 
         else:
             res18 = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-            self.backbone = nn.Sequential(*list(res18.children())[:6])  # [B, 128, 28, 28] 
-            curr_channels = 128
-            feat_size = 28        
+            self.backbone = nn.Sequential(*list(res18.children())[:7])  # [B, 256, 14, 14]
+            curr_channels = 256
+            feat_size = 14        
 
         self.d_model = 512
-        input_dim = curr_channels * 2 + curr_channels + 256 # 视觉坐标 + 语义特征 + 关节状态特征
+        input_dim = curr_channels * 2 + curr_channels + 128 # 视觉坐标 + 语义特征 + 关节状态特征
         self.deal_transformer_input = nn.Linear(input_dim, self.d_model)
 
         self.shared_se = SEBlock(curr_channels)
@@ -78,14 +81,19 @@ class BCNet_Transformer(nn.Module):
 
         # 位置编码
         self.pos_emb = nn.Parameter(torch.zeros(1, window_size, self.d_model))
-
         self.state_encoder = nn.Sequential(
             nn.Linear(joint_dim, 128),
             nn.LayerNorm(128),
             nn.PReLU(),
-            nn.Linear(128, 256),
+            nn.Linear(128, 128),
             nn.PReLU()
         )
+
+        # ---- 定义 Learnable Action Queries (K 个动作查询向量) ----
+        # [1, chunk_size, d_model]
+        self.action_queries = nn.Parameter(torch.zeros(1, chunk_size, self.d_model))
+        nn.init.trunc_normal_(self.action_queries, std=.02)
+        
         
         # Transformer 层
         encoder_layer = nn.TransformerEncoderLayer(
@@ -130,11 +138,21 @@ class BCNet_Transformer(nn.Module):
         combined = combined.view(B, T, -1)
         combined = combined + self.pos_emb[:, :T, :]  # 加入位置编码
         
-        # Transformer: 让每一帧都吸收到其他帧的信息
-        trafo_out = self.transformer_encoder(combined)  # (B, T, d_model)
+         # 准备 Action Queries 并扩展到 Batch 维度
+        queries = self.action_queries.expand(B, -1, -1) # [B, chunk_size, d_model]
         
-        # 取最后一帧预测
-        return self.fusion(trafo_out[:, -1, :])
+        full_seq = torch.cat([combined, queries], dim=1)
+        
+        # Transformer 交互
+        # 在这里，每一个 action query 都会通过 Attention 查看所有的图像帧
+        trafo_out = self.transformer_encoder(full_seq) # [B, T + chunk_size, d_model]
+        
+        # 提取最后 K 个位置的输出 (即 action queries 对应的输出)
+        action_outputs = trafo_out[:, T:, :] # [B, chunk_size, d_model]
+        
+        out = self.fusion(action_outputs) # [B, chunk_size, action_dim]
+
+        return out.view(B, self.chunk_size, -1)  # (B, chunk_size, action_dim)
     
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

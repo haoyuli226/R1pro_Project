@@ -53,6 +53,21 @@ class BCDataset(Dataset):
         self.demos = []
         self.indices = []  # 存储每个样本 (demo_idx, frame_idx)
 
+        if not isinstance(pkl_files, list) or len(pkl_files) == 0:
+            raise RuntimeError(f"pkl_files must be a non-empty list. Got: {pkl_files}")
+
+        print(f"[BCDataset] Loading {len(pkl_files)} demos...")
+        total = 0
+        for pkl_path in pkl_files: # 直接遍历文件列表
+            with open(pkl_path, "rb") as f:
+                data = pickle.load(f)
+                self.demos.append(data)
+                # 记录该 demo 在 self.demos 中的索引
+                current_demo_idx = len(self.demos) - 1
+                for i in range(len(data)):
+                    self.indices.append((current_demo_idx, i))
+                total += len(data)
+
         print(f"[BCDataset] Loading {len(pkl_files)} demos...")
         total = 0
         for pkl_path in pkl_files:
@@ -92,6 +107,8 @@ class BCDataset(Dataset):
         """
         img = T.ToPILImage()(rgb_np)
         # 深度图转为 Tensor 并在首位增加通道维度 (1, H, W)
+        # 先处理可能存在的非法值
+        depth_np = np.nan_to_num(depth_np, nan=0.0, posinf=3.0, neginf=0.0)
         depth = torch.from_numpy(depth_np).unsqueeze(0).float()
 
         if self.transform is None:
@@ -169,7 +186,6 @@ class BCDataset(Dataset):
         joint_states = torch.stack(joint_states)  # (T, joint_dim)
         depths = torch.stack(depths)  # (T, 1, H, W)
 
-        # --- 获取输出：未来 chunk_size 帧 (Future Actions) ---
         actions = []
         for i in range(frame_idx, frame_idx + self.chunk_size):
             # 如果超出当前 Demo 长度，则重复最后一帧动作 (Padding)
@@ -194,5 +210,5 @@ if __name__ == "__main__":
         for f in os.listdir(pkl_dir)
         if f.endswith(".pkl")
     ])
-    dataset = BCDataset(all_pkl_files, window_size=4, chunk_size=8)
+    dataset = BCDataset(all_pkl_files, window_size=4)
     print(f"Dataset length: {len(dataset)}")

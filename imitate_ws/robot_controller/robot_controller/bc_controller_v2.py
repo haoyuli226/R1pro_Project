@@ -10,7 +10,7 @@ from collections import deque
 import numpy as np
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 import time
-from bc_model_v2 import BCNet
+from bc_model import BCNet_Transformer
 from torchvision import transforms as T
 import pickle
 
@@ -38,6 +38,9 @@ class BCControlloer(Node):
         self.frame_count = 0
         self.last_log_time = time.time()
 
+        self.current_gripper_pos = None  # 初始化为 None
+        self.latest_depth = None         # 顺便初始化深度图，防止之前提到的潜在报错
+
         qos_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -50,11 +53,25 @@ class BCControlloer(Node):
             self.image_callback,
             qos_profile
         )
+
+        self.depth_sub = self.create_subscription(
+            Image,
+            '/hdas/camera_head/depth/depth_registered',
+            self.depth_callback,
+            qos_profile
+        )
         
         self.joint_sub = self.create_subscription(
             JointState,
             '/joint_states',
             self.joint_callback,
+            qos_profile
+        )
+
+        self.gripper_sub = self.create_subscription(
+            JointState,
+            '/hdas/feedback_gripper_right',
+            self.gripper_callback,
             qos_profile
         )
 
@@ -87,12 +104,13 @@ class BCControlloer(Node):
         self.window_size = 4 # 与训练时一致
         self.image_queue = deque(maxlen=self.window_size) 
         self.state_queue = deque(maxlen=self.window_size)
+        self.depth_queue = deque(maxlen=self.window_size)
 
         self.get_logger().info("BC Controller Node has been started.")
 
     def load_model(self):
-        model = BCNet().to(self.device)
-        model_path = "/home/nvidia/imitation_data_pipeline/imitate_ws/bc_model_v5.pth"
+        model = BCNet_Transformer().to(self.device)
+        model_path = "/home/nvidia/imitation_data_pipeline/imitate_ws/bc_model_v4.pth"
         
         if not os.path.exists(model_path):
             self.get_logger().error(f"model pth not exist: {model_path}")
@@ -120,6 +138,7 @@ class BCControlloer(Node):
             return None
 
     def image_callback(self, msg):
+        self.get_logger().info("Received new image frame")
         if self.image_lock:
             return
             
@@ -141,6 +160,42 @@ class BCControlloer(Node):
         finally:
             self.image_lock = False
 
+    def preprocess_depth_single(self, cv_depth):
+        """
+        深度图预处理：必须与训练时的 apply_sync_transform 保持一致
+        """
+        try:
+            depth_np = np.nan_to_num(cv_depth, nan=0.0, posinf=3.0, neginf=0.0)
+            depth_resized = cv2.resize(depth_np, (224, 224), interpolation=cv2.INTER_NEAREST)
+            depth_pt = torch.from_numpy(depth_resized).float().unsqueeze(0) # [1, 224, 224]
+            depth_pt = torch.clamp(depth_pt, 0.0, 3.0) / 3.0
+            return depth_pt
+        except Exception as e:
+            self.get_logger().error(f"Depth preprocess failed: {e}")
+            return None
+
+    def depth_callback(self, msg):
+        try:
+            # 如果是 16UC1，需要除以 1000 转化成米
+            cv_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+            if msg.encoding == '16UC1':
+                cv_depth = cv_depth.astype(np.float32) / 1000.0
+            self.latest_depth = cv_depth
+        except Exception as e:
+            self.get_logger().error(f"depth callback failed: {e}")
+
+    def gripper_callback(self, msg):
+        self.current_gripper_pos = msg.position[0]
+
+    def get_full_state(self):
+        if self.current_joint_state is None or self.current_gripper_pos is None:
+            return None
+        # 合并 24 维关节 + 1 维夹爪 = 25 维
+        full_state = np.zeros(25, dtype=np.float32)
+        full_state[0:24] = self.current_joint_state
+        full_state[24] = self.current_gripper_pos
+        return full_state
+
     def joint_callback(self, msg):
         try:
             name_to_pos = dict(zip(msg.name, msg.position))
@@ -159,10 +214,12 @@ class BCControlloer(Node):
     def timer_callback(self):
         if self.latest_image is None or self.current_joint_state is None:
             return 
+        self.get_logger().info("Got image and joint state, preparing input queues")
         
         self.image_queue.append(self.latest_image)
-        self.state_queue.append(self.current_joint_state.copy())
-            
+        self.state_queue.append(self.get_full_state())
+        self.depth_queue.append(self.latest_depth)
+
         # 队列未满时跳过推理
         if len(self.image_queue) < self.window_size:
             self.get_logger().info(f"Filling window... ({len(self.image_queue)}/{self.window_size})")
@@ -171,10 +228,14 @@ class BCControlloer(Node):
         try:
             img_list = []
             state_list = []
+            depth_list = []
             
             for i in range(self.window_size):
                 img_pt = self.preprocess_image_single(self.image_queue[i])
                 img_list.append(img_pt)
+
+                depth_pt = self.preprocess_depth_single(self.depth_queue[i])
+                depth_list.append(depth_pt)
                 
                 joint_raw = torch.from_numpy(self.state_queue[i]).float().to(self.device)
                 joint_norm = (joint_raw - self.joint_mean) / self.joint_std
@@ -186,9 +247,10 @@ class BCControlloer(Node):
             img_tensor = torch.stack(img_list).unsqueeze(0).to(self.device)
             self.get_logger().info(f"img_tensor shape: {img_tensor.shape}")
             joint_tensor = torch.stack(state_list).unsqueeze(0).to(self.device)
+            depth_tensor = torch.stack(depth_list).unsqueeze(0).to(self.device)
 
             with torch.no_grad():
-                output = self.model(img_tensor, joint_tensor)
+                output = self.model(img_tensor, joint_tensor, depth_tensor)
                 
             action_norm = output.squeeze(0)
             action_denorm = action_norm * self.action_std + self.action_mean

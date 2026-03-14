@@ -3,9 +3,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
-from pkl_2_dataset import BCDataset
+from pkl_2_dataset_v3 import BCDataset
 import time
-from bc_model_v3 import BCNet
+from bc_model_v6 import BCNet_Transformer
 from torch.utils.data import Subset
 import torchvision.transforms as T
 import numpy as np
@@ -15,9 +15,8 @@ pkl_dir = "/home/nvidia/imitation_data_pipeline/imitate_ws/output"
 
 batch_size = 64          
 num_epochs = 60          
-learning_rate = 2e-4
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model_save_path = "/home/nvidia/imitation_data_pipeline/imitate_ws/bc_model_v3.pth"
+model_save_path = "/home/nvidia/imitation_data_pipeline/imitate_ws/bc_model_v6.pth"
 val_split = 0.2         # 验证集比例
 
 if __name__ == "__main__":
@@ -53,18 +52,20 @@ if __name__ == "__main__":
 
     print(f"Training on {len(train_files)} demos, Validating on {len(val_files)} demos.")
 
-    train_dataset = BCDataset(train_files, transform=train_transform)
+    train_dataset = BCDataset(train_files, window_size=4, transform=train_transform)
     # 验证集必须使用训练集的 stats，否则数据分布会错位
-    val_dataset = BCDataset(val_files, transform=val_transform, stats=train_dataset.stats)
+    val_dataset = BCDataset(val_files, window_size=4, transform=val_transform, stats=train_dataset.stats)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False)
+
+
     
-    model = BCNet(joint_dim=train_dataset[0]['joint_state'].shape[0], 
-                  action_dim=train_dataset[0]['action'].shape[0]).to(device)
+    model = BCNet_Transformer(joint_dim=train_dataset[0]['joint_state'].shape[-1], 
+                  action_dim=train_dataset[-1]['action'].shape[0]).to(device)
 
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=2e-5, weight_decay=1e-4)
 
     best_val_loss = float('inf')
     start_time = time.time()
@@ -75,12 +76,13 @@ if __name__ == "__main__":
         model.train()
         train_running_loss = 0.0
         for i, batch in enumerate(train_loader):
-            images = batch["image"].to(device)
+            images = batch["image"].to(device)  # (B, T, C, H, W)
             joints = batch["joint_state"].to(device)
             actions = batch["action"].to(device)
+            depths = batch["depth"].to(device)
 
             optimizer.zero_grad()
-            outputs = model(images, joints)
+            outputs = model(images, joints, depths)
             loss = criterion(outputs, actions)
             loss.backward()
             optimizer.step()
@@ -97,8 +99,9 @@ if __name__ == "__main__":
                 images = batch["image"].to(device)
                 joints = batch["joint_state"].to(device)
                 actions = batch["action"].to(device)
+                depths = batch["depth"].to(device)
 
-                outputs = model(images, joints)
+                outputs = model(images, joints, depths)
                 loss = criterion(outputs, actions)
                 val_running_loss += loss.item()
         
