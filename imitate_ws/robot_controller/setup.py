@@ -23,6 +23,7 @@ setup(
             'robot_control = robot_controller.robot_control:main',
             'bc_controller = robot_controller.bc_controller:main',
             'keypoint_visualizer = robot_controller.keypoint_visualizer:main',
+            'view = robot_controller.view:main',
         ],
     },
 )
